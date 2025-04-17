@@ -1,0 +1,111 @@
+---
+- name: Network Health Check
+  hosts: all
+  gather_facts: yes
+  vars:
+    check_timeout: "{{ check_timeout | default(5) }}"
+    ports_to_check: "{{ ports_to_check | default([22, 80, 443, 3306, 5432]) }}"
+    retry_count: "{{ retry_count | default(3) }}"
+    retry_delay: "{{ retry_delay | default(2) }}"
+  
+  tasks:
+    - name: Set initial health status
+      ansible.builtin.set_fact:
+        health_status:
+          host: "{{ inventory_hostname }}"
+          status: "PENDING"
+          checks: []
+          start_time: "{{ ansible_date_time.iso8601 }}"
+          end_time: null
+          overall_status: "PENDING"
+
+    - name: Perform ping test
+      ansible.builtin.shell: |
+        ping -n {{ retry_count }} {{ inventory_hostname }} | findstr "Average"
+      register: ping_result
+      retries: "{{ retry_count }}"
+      delay: "{{ retry_delay }}"
+      until: ping_result.rc == 0
+      ignore_errors: yes
+
+    - name: Parse ping results
+      ansible.builtin.set_fact:
+        ping_stats:
+          status: "{{ 'UP' if ping_result.rc == 0 else 'DOWN' }}"
+          latency: "{{ ping_result.stdout | regex_search('Average = (\\d+)ms', '\\1') | default('N/A') }}"
+          attempts: "{{ ping_result.attempts | default(1) }}"
+      when: ping_result is defined
+
+    - name: Check common ports
+      ansible.builtin.wait_for:
+        host: "{{ inventory_hostname }}"
+        port: "{{ item }}"
+        timeout: "{{ check_timeout }}"
+      register: port_check
+      loop: "{{ ports_to_check }}"
+      ignore_errors: yes
+
+    - name: Check system resources
+      ansible.builtin.set_fact:
+        system_stats:
+          cpu_usage: "{{ ansible_processor_cores }}"
+          memory_total: "{{ ansible_memtotal_mb }}"
+          memory_free: "{{ ansible_memfree_mb }}"
+          uptime: "{{ ansible_uptime_seconds }}"
+      when: ansible_processor_cores is defined
+
+    - name: Compile health check results
+      ansible.builtin.set_fact:
+        health_status:
+          host: "{{ inventory_hostname }}"
+          status: "{{ 'HEALTHY' if ping_stats.status == 'UP' and port_check.results | selectattr('failed') | list | length == 0 else 'UNHEALTHY' }}"
+          checks:
+            - name: "Ping Test"
+              status: "{{ ping_stats.status }}"
+              details: "Latency: {{ ping_stats.latency }}ms, Attempts: {{ ping_stats.attempts }}"
+            - name: "Port Checks"
+              status: "{{ 'PASSED' if port_check.results | selectattr('failed') | list | length == 0 else 'FAILED' }}"
+              details: |
+                {% for result in port_check.results %}
+                - Port {{ result.item }}: {{ 'OPEN' if not result.failed else 'CLOSED' }}
+                {% endfor %}
+            - name: "System Resources"
+              status: "{{ 'AVAILABLE' if system_stats is defined else 'N/A' }}"
+              details: |
+                {% if system_stats is defined %}
+                CPU Cores: {{ system_stats.cpu_usage }}
+                Memory: {{ system_stats.memory_free }}MB free of {{ system_stats.memory_total }}MB
+                Uptime: {{ (system_stats.uptime / 3600) | round(2) }} hours
+                {% else %}
+                System stats not available
+                {% endif %}
+          end_time: "{{ ansible_date_time.iso8601 }}"
+          overall_status: "{{ 'HEALTHY' if ping_stats.status == 'UP' and port_check.results | selectattr('failed') | list | length == 0 else 'UNHEALTHY' }}"
+
+    - name: Display health check results
+      ansible.builtin.debug:
+        msg: |
+          ===== Health Check Results for {{ health_status.host }} =====
+          Overall Status: {{ health_status.overall_status }}
+          Start Time: {{ health_status.start_time }}
+          End Time: {{ health_status.end_time }}
+          
+          Detailed Checks:
+          {% for check in health_status.checks %}
+          - {{ check.name }}:
+            Status: {{ check.status }}
+            Details:
+            {{ check.details | indent(14) }}
+          {% endfor %}
+          
+          ============================================
+
+    - name: Set AWX job status
+      ansible.builtin.set_fact:
+        awx_job_status: "{{ 'success' if health_status.overall_status == 'HEALTHY' else 'failed' }}"
+      when: health_status is defined
+
+    - name: Fail if health check failed
+      ansible.builtin.fail:
+        msg: "Health check failed for {{ inventory_hostname }}. See detailed results above."
+      when: health_status.overall_status == 'UNHEALTHY'
